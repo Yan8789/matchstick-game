@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Matchstick Puzzle</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <script type="importmap">
+    {
+        "imports": {
+            "react": "https://esm.sh/react@18.2.0",
+            "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+            "lucide-react": "https://esm.sh/lucide-react@0.292.0"
+        }
+    }
+    </script>
+    
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <style>
+        /* 防止手機上的下拉重整干擾拖曳 */
+        body { overscroll-behavior: none; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useRef, useCallback } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { 
+            Play, Settings, Check, Trophy, 
+            RotateCcw, HelpCircle, X, ArrowLeft, Star, Lock, 
+            Heart, AlertCircle, Palette, Image as ImageIcon, Crown,
+            Volume2, VolumeX
+        } from 'lucide-react';
+
+        // --- 1. Core Config ---
+        const CONFIG = {
+            gridSize: 80,
+            stickScale: 1.5,
+            stickWidth: 20,
+            snapDistance: 0.6,
+            colors: {
+                bgDefault: '#f3f4f6',
+                primary: '#4f46e5',
+                secondary: '#f59e0b',
+                danger: '#ef4444',
+                success: '#22c55e',
+                woodLight: '#e5e7eb',
+                woodDark: '#d1d5db',
+            }
+        };
+
+        // --- 2. Audio Engine (Web Audio API) ---
+        const AudioEngine = {
+            ctx: null,
+            isMuted: false,
+
+            init() {
+                if (!this.ctx) {
+                    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                }
+                if (this.ctx.state === 'suspended') {
+                    this.ctx.resume();
+                }
+            },
+
+            setMuted(muted) {
+                this.isMuted = muted;
+            },
+
+            playTone(freq, type, duration, vol = 0.1, attack = 0.01, decay = 0.1) {
+                if (this.isMuted || !this.ctx) return;
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+                
+                osc.type = type;
+                osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+                
+                gain.gain.setValueAtTime(0, this.ctx.currentTime);
+                gain.gain.linearRampToValueAtTime(vol, this.ctx.currentTime + attack);
+                gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration + decay);
+                
+                osc.connect(gain);
+                gain.connect(this.ctx.destination);
+                
+                osc.start();
+                osc.stop(this.ctx.currentTime + duration + decay);
+            },
+
+            sfx: {
+                click: () => AudioEngine.playTone(800, 'sine', 0.05, 0.05),
+                woodTap: () => {
+                    if (AudioEngine.isMuted || !AudioEngine.ctx) return;
+                    const t = AudioEngine.ctx.currentTime;
+                    const osc = AudioEngine.ctx.createOscillator();
+                    const gain = AudioEngine.ctx.createGain();
+                    osc.frequency.setValueAtTime(300, t);
+                    osc.frequency.exponentialRampToValueAtTime(50, t + 0.1);
+                    gain.gain.setValueAtTime(0.15, t);
+                    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.1);
+                    osc.connect(gain);
+                    gain.connect(AudioEngine.ctx.destination);
+                    osc.start();
+                    osc.stop(t + 0.1);
+                },
+                pickup: () => AudioEngine.playTone(400, 'triangle', 0.05, 0.05),
+                error: () => {
+                    if (AudioEngine.isMuted || !AudioEngine.ctx) return;
+                    const t = AudioEngine.ctx.currentTime;
+                    const osc = AudioEngine.ctx.createOscillator();
+                    const gain = AudioEngine.ctx.createGain();
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(150, t);
+                    osc.frequency.linearRampToValueAtTime(100, t + 0.3);
+                    gain.gain.setValueAtTime(0.1, t);
+                    gain.gain.linearRampToValueAtTime(0.01, t + 0.3);
+                    osc.connect(gain);
+                    gain.connect(AudioEngine.ctx.destination);
+                    osc.start();
+                    osc.stop(t + 0.3);
+                },
+                win: () => {
+                    if (AudioEngine.isMuted || !AudioEngine.ctx) return;
+                    const now = AudioEngine.ctx.currentTime;
+                    [523.25, 659.25, 783.99, 1046.50].forEach((f, i) => {
+                        const osc = AudioEngine.ctx.createOscillator();
+                        const gain = AudioEngine.ctx.createGain();
+                        osc.type = 'sine';
+                        osc.frequency.setValueAtTime(f, now + i*0.1);
+                        gain.gain.setValueAtTime(0, now + i*0.1);
+                        gain.gain.linearRampToValueAtTime(0.1, now + i*0.1 + 0.05);
+                        gain.gain.exponentialRampToValueAtTime(0.001, now + i*0.1 + 0.8);
+                        osc.connect(gain);
+                        gain.connect(AudioEngine.ctx.destination);
+                        osc.start(now + i*0.1);
+                        osc.stop(now + i*0.1 + 1.0);
+                    });
+                }
+            }
+        };
+
+        // --- 3. Styles & Logic ---
+        const STICK_PRESETS = [
+            { id: 'wood', name: '經典原木', style: 'linear-gradient(to bottom, #e2b085, #a67c52)' },
+            { id: 'neon-red', name: '霓虹紅', style: 'linear-gradient(to bottom, #ff0055, #ff5588)', glow: '0 0 10px #ff0055' },
+            { id: 'neon-blue', name: '數碼藍', style: 'linear-gradient(to bottom, #00d2ff, #3a7bd5)', glow: '0 0 10px #00d2ff' },
+            { id: 'gold', name: '奢華金', style: 'linear-gradient(45deg, #FFD700, #FDB931, #FFD700)' },
+            { id: 'dark', name: '碳纖黑', style: 'linear-gradient(to bottom, #434343, #000000)' },
+        ];
+
+        const DIGIT_MAP = {
+        'b,bl,br,t,tl,tr': '0', 'br,tr': '1', 'b,bl,m,t,tr': '2', 'b,br,m,t,tr': '3',
+        'br,m,tl,tr': '4', 'b,br,m,t,tl': '5', 'b,bl,br,m,t,tl': '6', 'br,t,tr': '7',
+        'b,bl,br,m,t,tl,tr': '8', 'b,br,m,t,tl,tr': '9',
+        };
+
+        const CHAR_TO_SEGMENTS = {
+            '0': ['t','b','tl','tr','bl','br'], '1': ['tr','br'], '2': ['t','m','b','tr','bl'],
+            '3': ['t','m','b','tr','br'], '4': ['m','tl','tr','br'], '5': ['t','m','b','tl','br'],
+            '6': ['t','m','b','tl','bl','br'], '7': ['t','tr','br'], '8': ['t','m','b','tl','tr','bl','br'],
+            '9': ['t','m','b','tl','tr','br'], '+': ['h','v'], '-': ['h'], '=': ['t','b'], ' ': []
+        };
+
+        const SYMBOL_MAP = { 'h': '-', 'h,v': '+', 'b,t': '=' };
+
+        const SLOT_LAYOUT = [
+            { type: 'digit', x: 2.5 }, { type: 'op',    x: 5.5 },
+            { type: 'digit', x: 7.5 }, { type: 'eq',    x: 10.5 }, { type: 'digit', x: 12.5 }, 
+        ];
+
+        const createStick = (id, x, y, v) => ({ id, x, y, v });
+        const createSlot = (id, x, y, v, groupId, type) => ({ id, x, y, v, groupId, type });
+
+        const generateGlobalSlots = () => {
+            const slots = [];
+            const y = 2; 
+            SLOT_LAYOUT.forEach((layout, idx) => {
+                const { x, type } = layout;
+                const gid = `g${idx}`; 
+                if (type === 'digit') {
+                    slots.push(createSlot(`${gid}-t`, x+0.2, y, false, gid, 'digit'));
+                    slots.push(createSlot(`${gid}-m`, x+0.2, y+1.5, false, gid, 'digit'));
+                    slots.push(createSlot(`${gid}-b`, x+0.2, y+3, false, gid, 'digit'));
+                    slots.push(createSlot(`${gid}-tl`, x, y+0.2, true, gid, 'digit'));
+                    slots.push(createSlot(`${gid}-bl`, x, y+1.7, true, gid, 'digit'));
+                    slots.push(createSlot(`${gid}-tr`, x+1.7, y+0.2, true, gid, 'digit'));
+                    slots.push(createSlot(`${gid}-br`, x+1.7, y+1.7, true, gid, 'digit'));
+                } else if (type === 'op' || type === 'sign') {
+                    slots.push(createSlot(`${gid}-h`, x, y+1.5, false, gid, 'symbol'));
+                    slots.push(createSlot(`${gid}-v`, x+0.8, y+0.7, true, gid, 'symbol'));
+                } else if (type === 'eq') {
+                    slots.push(createSlot(`${gid}-t`, x, y+1.2, false, gid, 'symbol'));
+                    slots.push(createSlot(`${gid}-b`, x, y+1.8, false, gid, 'symbol'));
+                }
+            });
+            return slots;
+        };
+        const GLOBAL_SLOTS = generateGlobalSlots();
+
+        const generateLevelSticks = (formula) => {
+            let parts = formula.split('=');
+            if(parts.length < 2) return [];
+            let left = parts[0], right = parts[1]; 
+            let opMatch = left.match(/([0-9]+)([\+\-])([0-9]+)/);
+            if (!opMatch) return []; 
+            let d1 = opMatch[1], op = opMatch[2], d2 = opMatch[3];
+            
+            let mapData = { 0: d1, 1: op, 2: d2, 3: '=', 4: right };
+            
+            const sticks = [];
+            Object.keys(mapData).forEach(idx => {
+                const char = mapData[idx];
+                if(!char) return;
+                const segments = CHAR_TO_SEGMENTS[char];
+                const gid = `g${idx}`;
+                if(segments) segments.forEach(seg => {
+                    const slot = GLOBAL_SLOTS.find(s => s.groupId === gid && s.id.endsWith(`-${seg}`));
+                    if (slot) sticks.push(createStick(`${gid}-${seg}`, slot.x, slot.y, slot.v));
+                });
+            });
+            return sticks;
+        };
+
+        // --- 4. Level Data ---
+        const LEVELS_DB = [
+        { id: 1, category: "入門", title: "暖身練習", desc: "移動 1 根 (6+4=4)", hintText: "把 6 變成 0", moveLimit: 1, initial: generateLevelSticks("6+4=4") },
+        { id: 2, category: "基礎", title: "經典題", desc: "移動 1 根 (1+2=8)", hintText: "想辦法讓結果變大 (7)", moveLimit: 1, initial: generateLevelSticks("1+2=8") }, 
+        { id: 3, category: "進階", title: "觀察力", desc: "移動 1 根 (9+3=6)", hintText: "把加號變成減號", moveLimit: 1, initial: generateLevelSticks("9+3=6") },
+        { id: 4, category: "挑戰", title: "數字變換", desc: "移動 1 根 (5+7=2)", hintText: "5 變成 9，加號變...", moveLimit: 1, initial: generateLevelSticks("5+7=2") },
+        { id: 5, category: "挑戰", title: "減法陷阱", desc: "移動 1 根 (7+1=0)", hintText: "7 減 7 等於...", moveLimit: 1, initial: generateLevelSticks("7+1=0") },
+        { id: 6, category: "專家", title: "邏輯迷宮", desc: "移動 1 根 (0+3=2)", hintText: "3 變成 2", moveLimit: 1, initial: generateLevelSticks("0+3=2") },
+        { id: 7, category: "專家", title: "極限運算", desc: "移動 1 根 (5+9=9)", hintText: "5 變成 6，9 變成 3", moveLimit: 1, initial: generateLevelSticks("5+9=9") },
+        { id: 8, category: "傳說", title: "最終試煉", desc: "移動 2 根 (3-0=8)", hintText: "負號變正號，0 變成...", moveLimit: 2, initial: generateLevelSticks("3-0=8") },
+        ];
+
+        const recognizeEquation = (sticks) => {
+            const groups = {}; 
+            sticks.forEach(stick => {
+                let bestSlot = null, minD = 0.3;
+                GLOBAL_SLOTS.forEach(slot => {
+                    const d = Math.sqrt((stick.x - slot.x)**2 + (stick.y - slot.y)**2);
+                    if (d < minD && stick.v === slot.v) { minD = d; bestSlot = slot; }
+                });
+                if (bestSlot) {
+                    if (!groups[bestSlot.groupId]) groups[bestSlot.groupId] = [];
+                    groups[bestSlot.groupId].push(bestSlot.id.split('-').pop());
+                }
+            });
+            
+            let eq = "";
+            SLOT_LAYOUT.forEach((layout, idx) => {
+                const segments = groups[`g${idx}`];
+                const hasSticks = segments && segments.length > 0;
+                
+                if (!hasSticks) return;
+
+                const key = segments.sort().join(',');
+                
+                if (layout.type === 'digit') {
+                    if (DIGIT_MAP[key]) eq += DIGIT_MAP[key];
+                    else eq += "?"; 
+                } else if (layout.type === 'op' || layout.type === 'sign' || layout.type === 'eq') {
+                    if (SYMBOL_MAP[key]) eq += SYMBOL_MAP[key];
+                    else eq += "?"; 
+                }
+            });
+            return eq;
+        };
+
+        const safeCalculate = (str) => {
+            if (!str || !str.includes('=') || str.includes('?')) return false;
+            
+            const parts = str.split('=');
+            if (parts.length !== 2) return false;
+            const parseSide = (s) => {
+                if (!s || s.trim() === "") return NaN;
+                let nums = [], ops = [], curr = "";
+                for(let i=0; i<s.length; i++) {
+                    const c = s[i];
+                    if ((c === '+' || c === '-') && i > 0 && curr !== "") {
+                        nums.push(parseInt(curr, 10)); curr = ""; ops.push(c);
+                    } else curr += c;
+                }
+                if(curr !== "") nums.push(parseInt(curr, 10));
+                if (nums.length === 0 || nums.some(n => isNaN(n))) return NaN;
+                let res = nums[0];
+                for(let i=0; i<ops.length; i++) ops[i] === '+' ? res += nums[i+1] : res -= nums[i+1];
+                return res;
+            };
+            const left = parseSide(parts[0]), right = parseSide(parts[1]);
+            return !isNaN(left) && !isNaN(right) && Math.abs(left - right) < Number.EPSILON;
+        };
+
+        // --- 5. UI Components ---
+        const Stick = ({ id, x, y, v, isDragging, onDown, onMove, onUp, texture, customStyle, isPreview }) => {
+        const l = CONFIG.gridSize * CONFIG.stickScale;
+        const w = CONFIG.stickWidth;
+        const innerStyle = texture ? { backgroundImage: `url(${texture})`, backgroundSize: 'cover' } : { background: customStyle?.style || 'linear-gradient(to bottom, #e2b085, #a67c52)' };
+        const glowStyle = (!texture && customStyle?.glow) ? { boxShadow: customStyle.glow } : {};
+
+        return (
+            <div 
+            onPointerDown={(e)=>onDown && onDown(e,id)} 
+            onPointerMove={onMove} onPointerUp={onUp} onPointerLeave={onUp}
+            className={`${isPreview ? 'relative' : 'absolute'} touch-none select-none flex items-center justify-center ${isDragging?'z-50 cursor-grabbing':'z-10 cursor-grab'}`}
+            style={{
+                ...(isPreview ? {} : { left: x*CONFIG.gridSize+3, top: y*CONFIG.gridSize+3 }),
+                width: l, height: w, transformOrigin: `${w/2}px ${w/2}px`, 
+                transform: `rotate(${v?90:0}deg) scale(${isDragging?1.1:1})`,
+                transition: isDragging?'none':'all 0.3s'
+            }}>
+            <div className="absolute rounded-full bg-black opacity-20 blur-[2px]" style={{width:'100%',height:'100%',top:isDragging?15:2,left:isDragging?15:2}}/>
+            <div className="relative w-full h-full rounded-full overflow-hidden shadow-inner" style={{...innerStyle, ...glowStyle}}></div>
+            <div className="absolute left-[-4px] w-[12px] h-[110%] rounded-full bg-gradient-to-br from-red-500 to-red-800 shadow-sm z-20" />
+            </div>
+        );
+        };
+
+        const Groove = ({ x, y, v, active, isSign }) => {
+        const l = CONFIG.gridSize * CONFIG.stickScale;
+        const w = CONFIG.stickWidth + 8;
+        return (
+            <div className="absolute rounded-full transition-all duration-300"
+            style={{
+                left: x*CONFIG.gridSize, top: y*CONFIG.gridSize, width: l, height: w,
+                transformOrigin: `${w/2}px ${w/2}px`, transform: `rotate(${v?90:0}deg) scale(${active?1.05:1})`,
+                backgroundColor: isSign && !active ? 'transparent' : 'rgba(0,0,0,0.03)',
+                border: isSign ? '2px dashed #cbd5e1' : 'none',
+                boxShadow: active ? `0 0 10px ${CONFIG.colors.secondary}` : 'inset 1px 1px 2px rgba(0,0,0,0.1)',
+                opacity: isSign && !active ? 0.5 : 1
+            }}
+            />
+        );
+        };
+
+        // --- 6. Main App ---
+        function App() {
+            const [view, setView] = useState('home');
+            const [currentLevel, setCurrentLevel] = useState(null);
+            const [progress, setProgress] = useState({ 1: 0 });
+            const [theme, setTheme] = useState({ bg: null, stick: null, stickStyle: null });
+            const [isMuted, setIsMuted] = useState(false);
+            
+            const [showSettings, setShowSettings] = useState(false);
+            const [toast, setToast] = useState(null);
+            
+            const [sticks, setSticks] = useState([]);
+            const [moves, setMoves] = useState(0);
+            
+            const [scale, setScale] = useState(1);
+            const [pan, setPan] = useState({x:0, y:0});
+            const containerRef = useRef(null);
+            const bgInputRef = useRef(null);
+            const stickInputRef = useRef(null);
+
+            const [dragId, setDragId] = useState(null);
+            const [dragStart, setDragStart] = useState({x:0, y:0});
+            const [stickStart, setStickStart] = useState({x:0, y:0});
+            const [nearest, setNearest] = useState(null);
+
+            // Init Audio Engine
+            useEffect(() => {
+                const interact = () => {
+                    AudioEngine.init();
+                    window.removeEventListener('click', interact);
+                };
+                window.addEventListener('click', interact);
+                return () => window.removeEventListener('click', interact);
+            }, []);
+
+            const initLevel = (lvl) => {
+                AudioEngine.sfx.click();
+                setCurrentLevel(lvl);
+                setSticks(JSON.parse(JSON.stringify(lvl.initial)));
+                setMoves(0);
+                setView('game');
+            };
+
+            // Auto Fit
+            useEffect(() => {
+                const fit = () => {
+                    if(!containerRef.current) return;
+                    const {width, height} = containerRef.current.getBoundingClientRect();
+                    const w = width || window.innerWidth;
+                    const h = height || window.innerHeight;
+                    
+                    const s = Math.min(w/(16*CONFIG.gridSize), h/(10*CONFIG.gridSize), 1.0);
+                    setScale(s || 0.5);
+                    
+                    setPan({x: w/2 - (8.35*CONFIG.gridSize)*(s||0.5), y: h/2 - (3.5*CONFIG.gridSize)*(s||0.5)});
+                };
+                fit();
+                window.addEventListener('resize', fit);
+                setTimeout(fit, 100);
+                return () => window.removeEventListener('resize', fit);
+            }, [view, currentLevel]);
+
+            const showToast = (msg, error=false) => {
+                if(error) AudioEngine.sfx.error();
+                setToast({ msg, error });
+                setTimeout(() => { setToast(null); }, 3500);
+            };
+
+            const toggleMute = () => {
+                const newState = !isMuted;
+                setIsMuted(newState);
+                AudioEngine.setMuted(newState);
+            };
+
+            const handleCheckWin = () => {
+                AudioEngine.sfx.click();
+                if(moves === 0) { showToast("請先移動火柴", true); return; }
+                const eqStr = recognizeEquation(sticks);
+                const valid = safeCalculate(eqStr);
+                if (valid) {
+                    AudioEngine.sfx.win();
+                    setProgress(prev => ({ ...prev, [currentLevel.id]: 3 }));
+                    setView('win');
+                } else {
+                    const invalidPart = eqStr.includes('?') ? "(無效數字)" : `(${eqStr})`;
+                    showToast(`算式不正確 ${invalidPart}`, true);
+                }
+            };
+
+            const handleDown = (e, id) => {
+                e.stopPropagation();
+                const s = sticks.find(st => st.id===id);
+                const initS = currentLevel.initial.find(i => i.id===id);
+                const moved = initS && (Math.abs(s.x-initS.x)>0.1 || Math.abs(s.y-initS.y)>0.1 || s.v!==initS.v);
+                
+                if(moves >= currentLevel.moveLimit && !moved) { 
+                    showToast("沒有愛心了！", true); 
+                    return; 
+                }
+                AudioEngine.sfx.pickup();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                setDragId(id); setDragStart({x:e.clientX, y:e.clientY}); setStickStart({x:s.x, y:s.y});
+            };
+            
+            const handleMove = (e) => {
+                if(!dragId) return;
+                e.preventDefault();
+                const dx = (e.clientX - dragStart.x)/scale/CONFIG.gridSize;
+                const dy = (e.clientY - dragStart.y)/scale/CONFIG.gridSize;
+                const cx = stickStart.x+dx; const cy = stickStart.y+dy;
+                
+                let close = null; let min = Infinity;
+                GLOBAL_SLOTS.forEach(sl => {
+                    const d = Math.sqrt((sl.x-cx)**2 + (sl.y-cy)**2);
+                    const occupied = sticks.some(s => s.id!==dragId && Math.abs(s.x-sl.x)<0.1 && Math.abs(s.y-sl.y)<0.1 && s.v===sl.v);
+                    if(d<CONFIG.snapDistance && d<min && !occupied) { min=d; close=sl; }
+                });
+                setNearest(close);
+                setSticks(prev => prev.map(s => s.id===dragId ? {...s, x:cx, y:cy} : s));
+            };
+
+            const handleUp = () => {
+                if(!dragId) return;
+                AudioEngine.sfx.woodTap();
+                setSticks(prev => prev.map(s => {
+                    if(s.id===dragId) {
+                        const t = nearest || stickStart;
+                        return {...s, x:t.x, y:t.y, v:nearest?nearest.v:s.v};
+                    } return s;
+                }));
+                setTimeout(() => {
+                    setSticks(curr => {
+                        let m=0; const init=currentLevel.initial;
+                        curr.forEach(s=>{ const i=init.find(x=>x.id===s.id); if(i && (Math.abs(s.x-i.x)>0.1 || Math.abs(s.y-i.y)>0.1 || s.v!==i.v)) m++; });
+                        setMoves(m); return curr;
+                    });
+                }, 50);
+                setDragId(null); setNearest(null);
+            };
+
+            return (
+                <div className="fixed inset-0 overflow-hidden font-sans select-none bg-[#f3f4f6]"
+                    style={{ 
+                        backgroundImage: theme.bg ? `url(${theme.bg})` : 'none', 
+                        backgroundSize: 'cover', backgroundPosition: 'center' 
+                    }}>
+                    
+                    {/* View: Home */}
+                    {view === 'home' && (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/90 backdrop-blur-sm animate-in fade-in">
+                            <h1 className="text-6xl font-black text-slate-800 mb-8 tracking-tighter">MATCHSTICK</h1>
+                            <div className="flex flex-col gap-4 w-64">
+                                <button onClick={() => { AudioEngine.sfx.click(); setView('levels'); }} className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold text-lg shadow-xl flex items-center justify-center gap-3"><Play fill="currentColor"/> 開始遊戲</button>
+                                <button onClick={() => { AudioEngine.sfx.click(); setShowSettings(true); }} className="w-full py-4 bg-white border-2 border-slate-200 text-slate-700 rounded-2xl font-bold text-lg flex items-center justify-center gap-3"><Settings/> 設定</button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* View: Levels */}
+                    {view === 'levels' && (
+                        <div className="absolute inset-0 bg-slate-50 flex flex-col animate-in slide-in-from-right">
+                            <div className="p-6 flex items-center gap-4 bg-white shadow-sm z-10 shrink-0">
+                                <button onClick={()=>{AudioEngine.sfx.click(); setView('home')}} className="p-2 rounded-full hover:bg-slate-100"><ArrowLeft/></button>
+                                <h2 className="text-2xl font-black text-slate-800">關卡選擇</h2>
+                                <div className="ml-auto">
+                                    <button onClick={toggleMute} className="p-2 rounded-full hover:bg-slate-100">
+                                        {isMuted ? <VolumeX className="text-slate-400"/> : <Volume2 className="text-slate-800"/>}
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <div className="flex-1 overflow-y-auto p-6">
+                                <div className="grid grid-cols-4 gap-3 mb-8">
+                                    {LEVELS_DB.map((lvl, idx) => (
+                                        <button key={lvl.id} onClick={()=>initLevel(lvl)} disabled={!(idx===0 || progress[LEVELS_DB[idx-1].id]>0)}
+                                            className={`relative aspect-square rounded-2xl p-2 flex flex-col items-center justify-center gap-1 transition-all border-b-4 
+                                            ${(idx===0 || progress[LEVELS_DB[idx-1].id]>0)
+                                                ? 'bg-white border-slate-200 hover:-translate-y-1 hover:border-indigo-200'
+                                                : 'bg-slate-100 border-slate-200 opacity-60'}`}>
+                                            {!(idx===0 || progress[LEVELS_DB[idx-1].id]>0) && <Lock className="absolute top-2 right-2 text-slate-400" size={14}/>}
+                                            <span className={`font-black text-slate-800 ${lvl.id > 99 ? 'text-lg' : lvl.id > 9 ? 'text-xl' : 'text-2xl'}`}>{lvl.id}</span>
+                                            <div className="flex gap-0.5 h-3">
+                                                {[...Array(3)].map((_, i)=><Star key={i} size={10} fill={i<(progress[lvl.id]||0)?CONFIG.colors.secondary:"#e2e8f0"} className={i<(progress[lvl.id]||0)?"text-yellow-500":"text-slate-200"}/>)}
+                                            </div>
+                                            <span className="text-[10px] font-bold text-slate-400 uppercase truncate w-full text-center">{lvl.category}</span>
+                                        </button>
+                                    ))}
+                                </div>
+                                {/* Paid Unlock Area */}
+                                <div className="bg-gradient-to-r from-slate-800 to-slate-900 rounded-2xl p-6 text-white text-center shadow-lg">
+                                    <Crown size={48} className="mx-auto mb-4 text-yellow-300" />
+                                    <h3 className="text-xl font-bold mb-2">解鎖完整版</h3>
+                                    <p className="text-slate-400 text-sm mb-4">獲得無限愛心、解鎖 100+ 個傳奇關卡與特殊火柴樣式！</p>
+                                    <button className="w-full py-3 bg-white text-slate-900 rounded-xl font-black shadow-md active:scale-95 transition-transform">NT$ 330 解鎖</button>
+                                </div>
+                                <div className="h-20"></div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* View: Game */}
+                    {view === 'game' && currentLevel && (
+                        <div className="absolute inset-0 flex flex-col">
+                            <header className={`p-4 flex justify-between items-start z-40 ${theme.bg?'bg-white/80 backdrop-blur':''}`}>
+                                <button onClick={()=>{AudioEngine.sfx.click(); setView('levels')}} className="p-2 rounded-full hover:bg-black/5"><ArrowLeft/></button>
+                                <div className="flex flex-col items-center">
+                                    <div className="flex items-center gap-2">
+                                        <h2 className="font-bold text-lg">{currentLevel.title}</h2>
+                                    </div>
+                                    <div className="flex gap-1">{[...Array(currentLevel.moveLimit)].map((_, i) => <Heart key={i} size={18} fill={i < (currentLevel.moveLimit - moves) ? CONFIG.colors.danger : "#cbd5e1"} className={i < (currentLevel.moveLimit - moves) ? "text-red-500" : "text-slate-300"} />)}</div>
+                                </div>
+                                <div className="flex gap-2">
+                                    <button onClick={toggleMute} className="p-2 rounded-full hover:bg-black/5">
+                                        {isMuted ? <VolumeX className="text-slate-500"/> : <Volume2 className="text-slate-800"/>}
+                                    </button>
+                                    <button onClick={()=>initLevel(currentLevel)} className="p-2 rounded-full hover:bg-black/5"><RotateCcw/></button>
+                                </div>
+                            </header>
+
+                            {toast && <div className={`absolute top-20 left-1/2 -translate-x-1/2 z-50 px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 font-bold animate-bounce ${toast.error?'bg-red-500 text-white':'bg-slate-800 text-white'}`}>{toast.error?<AlertCircle/>:<HelpCircle/>}<span>{toast.msg}</span></div>}
+
+                            <div ref={containerRef} className="flex-1 relative">
+                                <div className="absolute top-0 left-0 transition-transform duration-200 ease-out" style={{transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`}}>
+                                    {GLOBAL_SLOTS.map((s,i)=><Groove key={i} {...s} active={nearest && nearest.x===s.x && nearest.y===s.y && nearest.v===s.v} isSign={s.type==='sign'}/>)}
+                                    {sticks.map(s=>(
+                                        <div key={s.id} onDoubleClick={(e)=>{e.stopPropagation();setSticks(prev=>prev.map(x=>x.id===s.id?{...x,v:!x.v}:x))}}>
+                                            <Stick {...s} isDragging={dragId===s.id} onDown={handleDown} onMove={handleMove} onUp={handleUp} texture={theme.stick} customStyle={theme.stickStyle} />
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="p-6 pb-8 z-40 flex items-center gap-3 justify-center">
+                                <button onClick={handleCheckWin} className="flex-1 py-4 bg-slate-900 text-white rounded-2xl font-bold text-lg shadow-xl active:scale-95 transition-transform flex items-center justify-center gap-2"><Check size={24}/> 提交</button>
+                                
+                                {/* Standard Hint Button */}
+                                <button onClick={()=>{AudioEngine.sfx.click(); showToast(currentLevel.hintText)}} className="p-4 bg-white rounded-2xl shadow-lg text-slate-500 hover:scale-105 hover:bg-slate-50 active:scale-95 transition-all"><HelpCircle/></button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* View: Win */}
+                    {view === 'win' && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-md animate-in fade-in z-50">
+                            <div className="bg-white p-8 rounded-3xl shadow-2xl text-center animate-in zoom-in w-80">
+                                <Trophy size={64} className="mx-auto text-yellow-500 mb-4" />
+                                <h2 className="text-3xl font-black text-slate-800 mb-2">過關！</h2>
+                                <div className="flex justify-center gap-2 mb-8">{[1,2,3].map(i=><Star key={i} size={24} fill="#f59e0b" className="text-yellow-500"/>)}</div>
+                                <div className="flex gap-4">
+                                    <button onClick={()=>{AudioEngine.sfx.click(); setView('levels')}} className="flex-1 py-3 bg-slate-100 rounded-xl font-bold">選單</button>
+                                    <button 
+                                        onClick={()=>{
+                                            AudioEngine.sfx.click();
+                                            const idx = LEVELS_DB.findIndex(l=>l.id===currentLevel.id);
+                                            if(idx<LEVELS_DB.length-1) initLevel(LEVELS_DB[idx+1]); else setView('levels');
+                                        }} 
+                                        className="flex-1 py-3 rounded-xl font-bold transition-all flex items-center justify-center gap-2 bg-indigo-600 text-white active:scale-95"
+                                    >
+                                        下一關
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Settings Modal */}
+                    {showSettings && (
+                        <div className="absolute inset-0 z-[80] bg-black/30 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in">
+                            <div className="bg-white w-full max-w-md rounded-3xl shadow-2xl overflow-hidden animate-in slide-in-from-bottom flex flex-col max-h-[90vh]">
+                                <div className="p-6 border-b flex justify-between items-center">
+                                    <h3 className="font-black text-xl">設定</h3>
+                                    <div className="flex items-center gap-3">
+                                        <button onClick={toggleMute} className="p-2 rounded-full hover:bg-slate-100">
+                                            {isMuted ? <VolumeX className="text-slate-400"/> : <Volume2 className="text-slate-800"/>}
+                                        </button>
+                                        <button onClick={()=>setShowSettings(false)} className="p-2 bg-slate-100 rounded-full hover:bg-slate-200"><X size={20}/></button>
+                                    </div>
+                                </div>
+                                <div className="p-6 overflow-y-auto space-y-6">
+
+                                    <div className="space-y-2">
+                                        <label className="block text-sm font-bold text-slate-500">即時預覽</label>
+                                        <div className="w-full h-32 rounded-2xl border-2 border-slate-100 relative overflow-hidden flex items-center justify-center shadow-inner"
+                                             style={{ backgroundImage: theme.bg ? `url(${theme.bg})` : 'none', backgroundColor: theme.bg ? 'transparent' : '#f8fafc', backgroundSize: 'cover', backgroundPosition: 'center' }}>
+                                            <Stick x={0} y={0} v={false} texture={theme.stick} customStyle={theme.stickStyle} onDown={()=>{}} isPreview={true} />
+                                            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 bg-black/5 rounded-full blur-sm -z-10"></div>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label className="block text-sm font-bold text-slate-500">遊戲背景</label>
+                                        <div className="flex gap-2">
+                                            <button onClick={()=>setTheme(p=>({...p,bg:null}))} className={`flex-1 py-3 border-2 rounded-xl text-sm font-bold transition-colors ${!theme.bg?'border-indigo-500 bg-indigo-50 text-indigo-700':'border-slate-100 text-slate-500'}`}>預設灰</button>
+                                            <button onClick={()=>bgInputRef.current.click()} className={`flex-1 py-3 border-2 border-dashed rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition-colors ${theme.bg?'border-indigo-500 text-indigo-700':'border-slate-200 text-slate-400'}`}>
+                                                <ImageIcon size={16}/> {theme.bg?'已上傳':'上傳圖片'}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label className="block text-sm font-bold text-slate-500">火柴樣式</label>
+                                        <div className="grid grid-cols-3 gap-2">
+                                            {STICK_PRESETS.map(preset => (
+                                                <button key={preset.id} onClick={() => setTheme(p => ({ ...p, stick: null, stickStyle: preset }))}
+                                                    className={`h-12 rounded-xl border-2 relative overflow-hidden transition-all active:scale-95 ${theme.stickStyle?.id === preset.id && !theme.stick ? 'border-indigo-500 ring-2 ring-indigo-200 ring-offset-1' : 'border-transparent'}`} style={{ background: '#f1f5f9' }}>
+                                                    <div className="absolute inset-0 flex items-center justify-center"><div className="w-16 h-2 rounded-full shadow-sm" style={{ background: preset.style, boxShadow: preset.glow }}></div></div>
+                                                </button>
+                                            ))}
+                                            <button onClick={()=>stickInputRef.current.click()} className={`h-12 rounded-xl border-2 border-dashed flex items-center justify-center text-slate-400 hover:text-indigo-500 hover:border-indigo-500 transition-colors ${theme.stick ? 'border-indigo-500 text-indigo-700 bg-indigo-50' : 'border-slate-200'}`}><ImageIcon size={18}/></button>
+                                        </div>
+                                    </div>
+                                    <input type="file" ref={bgInputRef} hidden accept="image/*" onChange={(e)=>{const f=e.target.files[0]; if(f) setTheme(p=>({...p,bg:URL.createObjectURL(f)}));}}/>
+                                    <input type="file" ref={stickInputRef} hidden accept="image/*" onChange={(e)=>{const f=e.target.files[0]; if(f) setTheme(p=>({...p,stick:URL.createObjectURL(f),stickStyle:null}));}}/>
+                                </div>
+                                <div className="p-4 bg-slate-50 border-t">
+                                    <button onClick={()=>setShowSettings(false)} className="w-full py-3 bg-slate-900 text-white rounded-xl font-bold shadow-lg active:scale-95 transition-transform">完成設定</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // 掛載 React
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+
+    </script>
+</body>
+</html>
